@@ -2,20 +2,15 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
 from app.core.database import get_db
+from app.core.deps import get_current_user, check_rate_limit
 from app.schemas.repository import Repository, RepositoryCreate, RepositoryList
 from app.models.repository import Repository as RepositoryModel
 from app.models.user import User as UserModel
 from app.services.github import GitHubService
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
-
-def get_current_user(db: Session = Depends(get_db)) -> UserModel:
-    """Get current user (simplified - in production use proper JWT validation)"""
-    # This is a placeholder - implement proper JWT validation
-    user = db.query(UserModel).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return user
 
 @router.get("/", response_model=RepositoryList)
 async def list_repositories(
@@ -40,56 +35,66 @@ async def list_repositories(
 @router.post("/sync")
 async def sync_repositories(
     db: Session = Depends(get_db),
-    current_user: UserModel = Depends(get_current_user)
+    current_user: UserModel = Depends(check_rate_limit)  # Rate limited
 ):
     """Sync repositories from GitHub"""
     try:
         repos = GitHubService.get_user_repositories(current_user.access_token)
 
         synced_count = 0
-        for repo in repos:
-            # Check if repository already exists
-            existing = db.query(RepositoryModel).filter(
-                RepositoryModel.github_id == repo.id
-            ).first()
+        updated_count = 0
 
-            if existing:
-                # Update existing repository
-                existing.name = repo.name
-                existing.full_name = repo.full_name
-                existing.description = repo.description
-                existing.url = repo.html_url
-                existing.default_branch = repo.default_branch
-                existing.language = repo.language
-                existing.stars = repo.stargazers_count
-                existing.forks = repo.forks_count
-                existing.is_private = repo.private
-            else:
-                # Create new repository
-                new_repo = RepositoryModel(
-                    user_id=current_user.id,
-                    github_id=repo.id,
-                    name=repo.name,
-                    full_name=repo.full_name,
-                    description=repo.description,
-                    url=repo.html_url,
-                    default_branch=repo.default_branch,
-                    language=repo.language,
-                    is_private=repo.private,
-                    stars=repo.stargazers_count,
-                    forks=repo.forks_count
-                )
-                db.add(new_repo)
-                synced_count += 1
+        for repo in repos:
+            try:
+                # Check if repository already exists
+                existing = db.query(RepositoryModel).filter(
+                    RepositoryModel.github_id == repo.id
+                ).first()
+
+                if existing:
+                    # Update existing repository
+                    existing.name = repo.name
+                    existing.full_name = repo.full_name
+                    existing.description = repo.description
+                    existing.url = repo.html_url
+                    existing.default_branch = repo.default_branch
+                    existing.language = repo.language
+                    existing.stars = repo.stargazers_count
+                    existing.forks = repo.forks_count
+                    existing.is_private = repo.private
+                    updated_count += 1
+                else:
+                    # Create new repository
+                    new_repo = RepositoryModel(
+                        user_id=current_user.id,
+                        github_id=repo.id,
+                        name=repo.name,
+                        full_name=repo.full_name,
+                        description=repo.description,
+                        url=repo.html_url,
+                        default_branch=repo.default_branch,
+                        language=repo.language,
+                        is_private=repo.private,
+                        stars=repo.stargazers_count,
+                        forks=repo.forks_count
+                    )
+                    db.add(new_repo)
+                    synced_count += 1
+            except Exception as e:
+                logger.error(f"Failed to sync repository {repo.full_name}: {str(e)}")
+                continue
 
         db.commit()
 
         return {
-            "message": f"Successfully synced repositories",
-            "synced_count": synced_count
+            "message": "Successfully synced repositories",
+            "synced_count": synced_count,
+            "updated_count": updated_count
         }
 
     except Exception as e:
+        logger.error(f"Sync failed: {str(e)}")
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to sync repositories: {str(e)}"
